@@ -1,0 +1,263 @@
+From: Abderrahmane Benbachir <abderrahmane.benbachir@polymtl.ca>
+Date: Mon, 25 Sep 2017 17:58:22 -0400
+Subject: [RFC] ftrace: add hypergraph plugin
+
+This is most known as hypertracing, where timestamping is done by host.
+Send to host function entry & exit and sched_switch events with hypercalls.
+
+Signed-off-by: Abderrahmane Benbachir <abderrahmane.benbachir@polymtl.ca>
+---
+ kernel/trace/Makefile           |   1 +
+ kernel/trace/trace_hypergraph.c | 228 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 229 insertions(+)
+ create mode 100644 kernel/trace/trace_hypergraph.c
+
+diff --git a/kernel/trace/Makefile b/kernel/trace/Makefile
+index 90f2701d92a7..a75eebdc144e 100644
+--- a/kernel/trace/Makefile
++++ b/kernel/trace/Makefile
+@@ -42,6 +42,7 @@ obj-$(CONFIG_NOP_TRACER) += trace_nop.o
+ obj-$(CONFIG_STACK_TRACER) += trace_stack.o
+ obj-$(CONFIG_MMIOTRACE) += trace_mmiotrace.o
+ obj-$(CONFIG_FUNCTION_GRAPH_TRACER) += trace_functions_graph.o
++obj-$(CONFIG_FUNCTION_GRAPH_TRACER) += trace_hypergraph.o
+ obj-$(CONFIG_TRACE_BRANCH_PROFILING) += trace_branch.o
+ obj-$(CONFIG_BLK_DEV_IO_TRACE) += blktrace.o
+ ifeq ($(CONFIG_BLOCK),y)
+diff --git a/kernel/trace/trace_hypergraph.c b/kernel/trace/trace_hypergraph.c
+new file mode 100644
+index 000000000000..7a18715e3285
+--- /dev/null
++++ b/kernel/trace/trace_hypergraph.c
+@@ -0,0 +1,228 @@
++/*
++ * Hypergraph : Function graph tracer specific for virtual machine.
++ * Instead of using the buffer we send function entry & exit and
++ * sched_switch events through hypercalls.
++ *
++ * Copyright(c) 2017 Abderrahmane Benbachir <abderrahmane.benbachir@polymtl.ca>
++ * Inspired from function_graph and function tracers which is Copyright (c)
++ * Steven Rostedt <srostedt@redhat.com> &
++ * Frederic Weisbecker <fweisbec@gmail.com>
++ *
++ */
++#include <linux/uaccess.h>
++#include <linux/module.h>
++#include <linux/ftrace.h>
++#include <linux/interrupt.h>
++#include <trace/events/sched.h>
++#include <linux/hypervisor.h>
++#include <asm/setup.h>
++#include <linux/fs.h>
++#include "trace.h"
++
++#define HYPERGRAPH_FUNC_ENTRY_NR 100
++#define HYPERGRAPH_FUNC_EXIT_NR 101
++#define HYPERGRAPH_SCHED_SWITCH_NR 1000
++
++#ifdef CONFIG_X86_64
++#define ASM __asm__ __volatile__
++#else
++#define ASM asm volatile
++#endif
++
++static inline void do_hypercall(long nr, long p1, long p2, long p3, long p4)
++{
++	ASM(".byte 0x0F,0x01,0xC1\n"::"a"(nr), "b"(p1),
++		"c"(p2), "d"(p3), "S"(p4));
++}
++
++static int tracing_enabled;
++
++static unsigned int max_depth;
++
++/* When set, irq functions will be traced */
++static int hypergraph_irqs_enabled;
++
++static struct trace_array *hypergraph_array;
++
++static inline int ftrace_hypergraph_ignore_irqs(void)
++{
++	if (hypergraph_irqs_enabled || trace_recursion_test(TRACE_IRQ_BIT))
++		return 0;
++
++	return irq_count();
++}
++
++static void probe_sched_switch(void *ignore, bool preempt,
++	   struct task_struct *prev, struct task_struct *next)
++{
++	long *buffer = (long *)next->comm;
++
++	if (!tracing_enabled)
++		return;
++	/*
++	 * Do hypercall to send sched_switch event to host
++	 */
++	do_hypercall(HYPERGRAPH_SCHED_SWITCH_NR,
++		 prev->pid,
++		 next->pid,
++		 buffer[1],
++		 buffer[0]);
++}
++
++static int trace_hypergraph_entry(struct ftrace_graph_ent *trace)
++{
++	struct trace_array *tr = hypergraph_array;
++
++	if (!tracing_enabled || !ftrace_trace_task(tr))
++		return 0;
++
++	/* trace it when it is-nested-in or is a function enabled. */
++	if (!(trace->depth || ftrace_graph_addr(trace->func)) ||
++		(trace->depth < 0) || (max_depth && trace->depth >= max_depth))
++		return 0;
++
++	if (ftrace_hypergraph_ignore_irqs())
++		return 0;
++	/*
++	 * Do not trace a function if it's filtered by set_graph_notrace.
++	 */
++	if (ftrace_graph_notrace_addr(trace->func))
++		return 1;
++	/*
++	 * Do hypercall to send function entry event to host
++	 */
++	do_hypercall(HYPERGRAPH_FUNC_ENTRY_NR,
++		 trace->func, trace->depth, 0, 0);
++
++	return 1;
++}
++
++static void trace_hypergraph_return(struct ftrace_graph_ret *trace)
++{
++	/*
++	 * Do hypercall to send function exit event to host
++	 */
++	do_hypercall(HYPERGRAPH_FUNC_EXIT_NR,
++		 trace->func,
++		 (trace->rettime - trace->calltime),
++		 trace->depth,
++		 0);
++}
++
++static void hypergraph_trace_start(struct trace_array *tr)
++{
++	tracing_enabled = 1;
++}
++
++static void hypergraph_trace_stop(struct trace_array *tr)
++{
++	tracing_enabled = 0;
++}
++
++static int hypergraph_trace_init(struct trace_array *tr)
++{
++	int ret;
++
++	ret = register_trace_sched_switch(probe_sched_switch, NULL);
++	if (ret) {
++		printk(KERN_INFO"sched trace: Couldn't activate tracepoint"
++			"probe to kernel_sched_switch\n");
++	}
++
++	hypergraph_array = tr;
++
++	ret = register_ftrace_graph(&trace_hypergraph_return,
++			&trace_hypergraph_entry);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static void hypergraph_trace_reset(struct trace_array *tr)
++{
++	tracing_enabled = 0;
++	unregister_ftrace_graph();
++	unregister_trace_sched_switch(probe_sched_switch, NULL);
++}
++
++static struct tracer hypergraph_trace __tracer_data = {
++	.name		= "hypergraph",
++	.init		= hypergraph_trace_init,
++	.reset		= hypergraph_trace_reset,
++	.start		= hypergraph_trace_start,
++	.stop		= hypergraph_trace_stop
++};
++
++static ssize_t
++hypergraph_depth_write(struct file *filp, const char __user *ubuf,
++	size_t cnt, loff_t *ppos)
++{
++	unsigned long val;
++	int ret;
++
++	ret = kstrtoul_from_user(ubuf, cnt, 10, &val);
++	if (ret)
++		return ret;
++
++	max_depth = val;
++	*ppos += cnt;
++	return cnt;
++}
++
++static ssize_t
++hypergraph_depth_read(struct file *filp, char __user *ubuf, size_t cnt,
++	loff_t *ppos)
++{
++	char buf[15]; /* More than enough to hold UINT_MAX + "\n"*/
++	int n;
++
++	n = sprintf(buf, "%d\n", max_depth);
++	return simple_read_from_buffer(ubuf, cnt, ppos, buf, n);
++}
++
++static const struct file_operations hypergraph_depth_fops = {
++	.open		= tracing_open_generic,
++	.write		= hypergraph_depth_write,
++	.read		= hypergraph_depth_read,
++	.llseek		= generic_file_llseek,
++};
++
++static __init int init_hypergraph_tracefs(void)
++{
++	struct dentry *d_tracer;
++
++	d_tracer = tracing_init_dentry();
++	if (IS_ERR(d_tracer))
++		return 0;
++
++	trace_create_file("max_hypergraph_depth", 0644, d_tracer,
++		  NULL, &hypergraph_depth_fops);
++
++	return 0;
++}
++fs_initcall(init_hypergraph_tracefs);
++
++/*
++ * command line interface to allow users to set config on boot up.
++ */
++static __init int set_max_hypergraph_depth(char *str)
++{
++	long val;
++
++	if (kstrtol(str, 10, &val) == 0)
++		max_depth = val;
++
++	return 1;
++}
++__setup("ftrace_hypergraph_max_depth=", set_max_hypergraph_depth);
++
++static __init int init_hypergraph_trace(void)
++{
++	int ret;
++
++	ret = register_tracer(&hypergraph_trace);
++	return ret;
++}
++
++early_initcall(init_hypergraph_trace);
+-- 
+2.11.0
+
